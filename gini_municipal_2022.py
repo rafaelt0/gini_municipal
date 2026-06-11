@@ -132,12 +132,21 @@ def descobrir_estrutura_censo():
     id_renda, categorias, outras = None, {}, []
     for c in meta["classificacoes"]:
         nc = _norm(c["nome"])
-        if "rendimento" in nc and "salario" in nc:
+        # Aceita se o nome da classificação menciona rendimento OU se suas
+        # categorias contêm referências a salário mínimo (nome pode variar).
+        cats_candidatas = {}
+        for cat in c.get("categorias", []):
+            b = parse_classe(cat["nome"])
+            if b is not None:
+                cats_candidatas[cat["id"]] = (cat["nome"], b)
+        tem_renda_no_nome = "rendimento" in nc
+        tem_sm_nas_cats = any(
+            "salario" in _norm(cat["nome"]) or "sem rendimento" in _norm(cat["nome"])
+            for cat in c.get("categorias", [])
+        )
+        if (tem_renda_no_nome or tem_sm_nas_cats) and len(cats_candidatas) >= 3:
             id_renda = c["id"]
-            for cat in c["categorias"]:
-                b = parse_classe(cat["nome"])
-                if b is not None:
-                    categorias[cat["id"]] = (cat["nome"], b)
+            categorias = cats_candidatas
         else:
             outras.append(c["id"])
 
