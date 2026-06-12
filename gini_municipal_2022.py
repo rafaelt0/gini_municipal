@@ -29,10 +29,32 @@ Método: limites de Gastwirth (1972) + estimativa pontual lognormal.
     Desvio absoluto médio entre proporções observadas e preditas pelo
     lognormal por faixa. Valores > 0,04 indicam ajuste insatisfatório.
 
+  Estimativa pontual de Gastwirth (coluna gini_pontual):
+    Ponto médio de (gini_inf + gini_sup)/2. Pressupõe desigualdade
+    intra-faixa uniforme entre zero e o máximo. Sempre dentro dos
+    limitantes por construção; estimativa recomendada quando
+    gini_lognormal viola os bounds (ln_outside_bounds=True).
+
+  Intervalo de confiança assintótico 95% para gini_lognormal
+    (colunas gini_ln_ic95_inf / gini_ln_ic95_sup):
+    Método delta: propaga a incerteza de σ̂ (via Hessiana numérica da
+    neg-log-verossimilhança em (μ, log σ)) para o Gini usando
+    dG/d(log σ) = 2(1−p₀)² φ(σ/√2)·σ/√2. Válido assintoticamente
+    sob a distribuição multinomial das contagens agrupadas.
+
+  Sensibilidade ao tratamento dos não-declarantes
+    (coluna gini_ln_decsens_zero):
+    Gini lognormal reestimado assumindo que todos os domicílios sem
+    declaração de rendimento têm renda zero (adicionados à classe
+    "sem rendimento"). Quantifica o viés máximo introduzido pela
+    exclusão dos não-declarantes. Presente somente quando
+    pct_sem_declaracao > 0.
+
   Consistência com os bounds (coluna ln_outside_bounds):
     True quando gini_lognormal > gini_sup. Ocorre porque o lognormal
     tem suporte em (0,∞) enquanto os bounds assumem suporte dentro de
     cada faixa. São estimadores com premissas distintas; não implica erro.
+    Use gini_pontual nesses casos como alternativa conservadora.
 
   Análise de sensibilidade ao α (padrão: α ∈ {1,2; 1,5; 2,0}):
     Colunas gini_inf_a{α} e gini_sup_a{α} sempre presentes no CSV.
@@ -266,6 +288,78 @@ def gini_lognormal_mixed(mu, sigma, p_zero):
     Reduz a 2Φ(σ/√2)−1 quando p_zero=0 (Gini do lognormal puro).
     """
     return 1.0 - 2.0 * (1.0 - p_zero) ** 2 * _norm.cdf(-sigma / math.sqrt(2.0))
+
+
+def gini_lognormal_ic_delta(classes_pos, p_zero, mu_fit, sigma_fit, alpha=0.05):
+    """IC assintótico (método delta) para gini_lognormal a nível 1−alpha.
+
+    Estima a Hessiana numérica da neg-log-verossimilhança em (mu, log_sigma)
+    e propaga a incerteza de sigma para o Gini:
+      G = 1 − 2(1−p₀)² Φ(−σ/√2)
+      dG/d(log σ) = 2(1−p₀)² φ(σ/√2) · σ/√2
+      Var(G) ≈ [dG/d(log σ)]² · [H⁻¹]₁₁ / N
+
+    Retorna (ic_inf, ic_sup) arredondado a 4 casas, ou (None, None) se falha.
+    """
+    dados = [(li, ls, pop) for li, ls, pop in classes_pos if pop > 0]
+    if len(dados) < 3:
+        return None, None
+    total = sum(p for _, _, p in dados)
+    if total <= 0:
+        return None, None
+
+    log_sigma_fit = math.log(sigma_fit)
+
+    def _bp(li, ls, mu, sigma):
+        if ls is None:
+            return 1.0 - _norm.cdf((math.log(max(li, 1e-9)) - mu) / sigma)
+        elif li <= 0:
+            return _norm.cdf((math.log(max(ls, 1e-9)) - mu) / sigma)
+        else:
+            return (_norm.cdf((math.log(ls) - mu) / sigma)
+                    - _norm.cdf((math.log(li) - mu) / sigma))
+
+    def nll(mu, log_s):
+        s = math.exp(log_s)
+        return (-sum(pop * math.log(max(_bp(li, ls, mu, s), 1e-12))
+                     for li, ls, pop in dados) / total)
+
+    h = max(1e-4, sigma_fit * 0.01)
+    try:
+        f00 = nll(mu_fit, log_sigma_fit)
+        H00 = (nll(mu_fit + h, log_sigma_fit) - 2.0 * f00
+               + nll(mu_fit - h, log_sigma_fit)) / h ** 2
+        H11 = (nll(mu_fit, log_sigma_fit + h) - 2.0 * f00
+               + nll(mu_fit, log_sigma_fit - h)) / h ** 2
+        H01 = (nll(mu_fit + h, log_sigma_fit + h)
+               - nll(mu_fit + h, log_sigma_fit - h)
+               - nll(mu_fit - h, log_sigma_fit + h)
+               + nll(mu_fit - h, log_sigma_fit - h)) / (4.0 * h ** 2)
+    except Exception:
+        return None, None
+
+    det = H00 * H11 - H01 ** 2
+    if det < 1e-14 or not math.isfinite(det):
+        return None, None
+
+    # Var(log_sigma) = [H_norm⁻¹]₁₁ / N = H00 / (det · N)
+    # H_norm é a Hessiana da neg_ll normalizada; H_real = N · H_norm; Cov = H_real⁻¹
+    var_log_sigma = H00 / (det * total)
+    if var_log_sigma <= 0 or not math.isfinite(var_log_sigma):
+        return None, None
+
+    dG_dsigma = (2.0 * (1.0 - p_zero) ** 2
+                 * _norm.pdf(sigma_fit / math.sqrt(2.0)) / math.sqrt(2.0))
+    dG_dlog_sigma = dG_dsigma * sigma_fit
+    var_gini = dG_dlog_sigma ** 2 * var_log_sigma
+    if var_gini <= 0:
+        return None, None
+
+    z = 1.959963985  # Φ⁻¹(0.975)
+    se = math.sqrt(var_gini)
+    gini = gini_lognormal_mixed(mu_fit, sigma_fit, p_zero)
+    return (round(max(0.0, gini - z * se), 4),
+            round(min(1.0, gini + z * se), 4))
 
 
 # ── Estrutura do Censo ─────────────────────────────────────────────────────────
@@ -829,13 +923,53 @@ def main():
                     except Exception:
                         pass
 
+        # IC assintótico (método delta, 95%) para gini_lognormal
+        gini_ln_ic_inf = gini_ln_ic_sup = None
+        if ln_params is not None and gini_ln is not None:
+            gini_ln_ic_inf, gini_ln_ic_sup = gini_lognormal_ic_delta(
+                classes_pos, p_zero, mu_fit, sigma_fit
+            )
+
+        # Sensibilidade ao tratamento dos não-declarantes:
+        # trata todos como renda zero e reestima o Gini lognormal
+        gini_ln_decsens_zero = None
+        if pop_sem_declaracao > 0:
+            classes_d = list(classes)
+            zero_idx = next(
+                (i for i, (li, ls, _) in enumerate(classes_d)
+                 if li == 0.0 and ls is not None and ls == 0.0), -1
+            )
+            if zero_idx >= 0:
+                li_, ls_, pop_ = classes_d[zero_idx]
+                classes_d[zero_idx] = (li_, ls_, pop_ + pop_sem_declaracao)
+            else:
+                classes_d.append((0.0, 0.0, pop_sem_declaracao))
+            pop_zero_d = sum(p for li, ls, p in classes_d
+                             if li == 0.0 and ls is not None and ls == 0.0)
+            pop_cls_d = sum(c[2] for c in classes_d)
+            p_zero_d = pop_zero_d / pop_cls_d if pop_cls_d > 0 else 0.0
+            cls_pos_d = [(li, ls, p) for li, ls, p in classes_d
+                         if not (li == 0.0 and ls is not None and ls == 0.0)]
+            ln_d = fit_lognormal_grouped(cls_pos_d)
+            if ln_d is not None:
+                mu_d, sigma_d, _ = ln_d
+                gini_ln_decsens_zero = round(
+                    gini_lognormal_mixed(mu_d, sigma_d, p_zero_d), 4
+                )
+
         res = gini_agrupado(classes, alpha_topo=alpha_uf, medias_override=medias_override)
 
         if res is None:
             g_inf = g_sup = None
+            gini_pontual = None
         else:
             g_inf, g_sup = res
             ln_outside = (gini_ln > g_sup) if gini_ln is not None else None
+            # Estimativa pontual de Gastwirth: ponto médio dos limitantes.
+            # Sempre dentro de [gini_inf, gini_sup]; evita a violação de bounds
+            # do estimador lognormal e tem interpretação transparente: pressupõe
+            # desigualdade intra-faixa uniforme entre zero e o máximo.
+            gini_pontual = round((g_inf + g_sup) / 2.0, 4)
 
         # Sensibilidade ao α (padrão + extras)
         sens = {}
@@ -853,7 +987,11 @@ def main():
             "alpha_pareto": round(alpha_uf, 4),
             "gini_inf": round(g_inf, 4) if g_inf is not None else None,
             "gini_sup": round(g_sup, 4) if g_sup is not None else None,
+            "gini_pontual": gini_pontual,
             "gini_lognormal": round(gini_ln, 4) if gini_ln is not None else None,
+            "gini_ln_ic95_inf": gini_ln_ic_inf,
+            "gini_ln_ic95_sup": gini_ln_ic_sup,
+            "gini_ln_decsens_zero": gini_ln_decsens_zero,
             "ln_sigma": round(ln_sigma, 4) if ln_sigma is not None else None,
             "ln_mad": round(ln_mad, 4) if ln_mad is not None else None,
             "ln_converged": ln_converged,
@@ -869,7 +1007,8 @@ def main():
     print(f"\n{len(res_df)} municípios → {args.saida}")
 
     # ── 6. Sumário para o paper ──────────────────────────────────────────────
-    cols_summary = [c for c in ["gini_inf", "gini_sup", "gini_lognormal"]
+    cols_summary = [c for c in
+                    ["gini_inf", "gini_sup", "gini_pontual", "gini_lognormal"]
                     if c in res_df.columns]
     print("\n" + res_df[cols_summary].describe().round(4).to_string())
 
@@ -880,10 +1019,25 @@ def main():
           f"{n_outside} fora dos bounds ({100*n_outside/len(res_df):.1f}%) | "
           f"{n_bad} MAD > {LN_MAD_THRESHOLD} ({100*n_bad/len(res_df):.1f}%)")
 
+    if "gini_ln_ic95_inf" in res_df.columns:
+        n_ic = int(res_df["gini_ln_ic95_inf"].notna().sum())
+        if n_ic > 0:
+            ic_w = (res_df["gini_ln_ic95_sup"] - res_df["gini_ln_ic95_inf"]).dropna()
+            print(f"IC delta 95%  : {n_ic}/{len(res_df)} calculados | "
+                  f"largura média {ic_w.mean():.4f} (dp {ic_w.std():.4f})")
+
     if "pct_sem_declaracao" in res_df.columns:
         n_pos = int((res_df["pct_sem_declaracao"] > 0).sum())
         pct_max = res_df["pct_sem_declaracao"].max() * 100
         print(f"Sem declaração: {n_pos} municípios com >0% | máx {pct_max:.2f}%")
+
+    if "gini_ln_decsens_zero" in res_df.columns:
+        comp = res_df.dropna(subset=["gini_lognormal", "gini_ln_decsens_zero"])
+        if len(comp) > 0:
+            delta = (comp["gini_ln_decsens_zero"] - comp["gini_lognormal"])
+            n_dec = int((res_df["pct_sem_declaracao"] > 0).sum())
+            print(f"Sensib. dec.  : {n_dec} municípios afetados | "
+                  f"Δ médio {delta.mean():+.4f} (máx {delta.max():+.4f})")
 
     if "gini_2010" in res_df.columns:
         val = res_df.dropna(subset=["gini_2010", "gini_lognormal"])
