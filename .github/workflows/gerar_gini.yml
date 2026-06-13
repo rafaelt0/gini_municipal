@@ -1,0 +1,45 @@
+name: Gerar Gini Municipal 2022
+
+on:
+  workflow_dispatch:
+    inputs:
+      uf:
+        description: "Código IBGE da UF (deixe vazio para todos os municípios)"
+        required: false
+        default: ""
+      alpha:
+        description: "Parâmetro Pareto α fixo para a classe aberta (vazio = calibrar via PNAD)"
+        required: false
+        default: ""
+
+jobs:
+  gerar-csv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: claude/gini-municipal-2022-uy6h5w
+
+      - name: Instalar dependências
+        run: pip install requests pandas
+
+      - name: Executar script
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.uf }}" ]; then
+            ARGS="$ARGS --uf ${{ github.event.inputs.uf }}"
+          fi
+          if [ -n "${{ github.event.inputs.alpha }}" ]; then
+            ARGS="$ARGS --alpha ${{ github.event.inputs.alpha }}"
+          fi
+          python gini_municipal_2022.py $ARGS
+
+      - name: Salvar CSV como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gini_municipal_2022
+          path: gini_municipal_2022.csv
+          retention-days: 30
