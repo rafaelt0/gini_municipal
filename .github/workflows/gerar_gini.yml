@@ -15,16 +15,16 @@ on:
 jobs:
   gerar-csv:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: claude/gini-municipal-2022-uy6h5w
+          ref: claude/econometrica-methodology-review-ej1oih
 
       - name: Instalar dependências
-        run: pip install requests pandas
+        run: pip install requests pandas scipy numpy
 
       - name: Executar script
         run: |
@@ -43,3 +43,11 @@ jobs:
           name: gini_municipal_2022
           path: gini_municipal_2022.csv
           retention-days: 30
+
+      - name: Commit e push do CSV atualizado
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add gini_municipal_2022.csv
+          git diff --cached --quiet || git commit -m "Atualizar CSV com Gamma, Singh-Maddala e AIC [skip ci]"
+          git push
