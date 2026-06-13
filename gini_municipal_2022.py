@@ -25,6 +25,17 @@ Método: limites de Gastwirth (1972) + estimativa pontual lognormal.
     Gini = 1 − 2(1−p_zero)² Φ(−σ/√2)
     onde p_zero é a fração de domicílios sem rendimento.
 
+  Distribuições alternativas (colunas gini_gamma, gini_singh_maddala):
+    Além da lognormal, ajusta por MLE Gamma(α, β) e Singh-Maddala(a, b, q).
+    Gini misto para qualquer distribuição: G = p_zero + (1−p_zero) · G_+
+    • Gamma: G_+ = Γ(α+½) / (√π · Γ(α+1)) — fórmula analítica
+    • Singh-Maddala: G_+ via G = (2/μ)·∫x·F(x)·f(x)dx − 1 — integração numérica
+    Fórmula geral vale para qualquer distribuição: derivada da curva de Lorenz.
+
+  Comparação por AIC (colunas aic_lognormal, aic_gamma, aic_singh_maddala):
+    AIC = 2k − 2·LL  onde k = número de parâmetros (2, 2, 3) e LL = Σᵢ nᵢ log P̂ᵢ.
+    Coluna melhor_dist indica a distribuição com menor AIC.
+
   Intervalos de confiança 95% (colunas gini_ic_low, gini_ic_high, gini_se):
     Método delta aplicado ao estimador MLE lognormal.
     A matriz de covariância assintótica é obtida invertendo a Hessiana
@@ -76,7 +87,11 @@ import unicodedata
 import numpy as np
 import pandas as pd
 import requests
+from scipy import integrate as _integrate
 from scipy.optimize import minimize
+from scipy.special import gammaln as _gammaln
+from scipy.stats import gamma as _gamma_dist
+from scipy.stats import burr12 as _sm_dist
 from scipy.stats import norm as _norm
 
 # ── Constantes ────────────────────────────────────────────────────────────────
@@ -213,7 +228,8 @@ def ic_delta_lognormal(mu_fit, sigma_fit, p_zero, classes_pos, z=1.96):
         return None
 
     # Gradiente de G em relação a (μ, log σ)
-    dG_dlogsigma = (2.0 * (1.0 - p_zero) ** 2
+    # G = 1 − 2(1−p0)Φ(−σ/√2)  →  dG/d(log σ) = 2(1−p0)φ(σ/√2)·σ/√2
+    dG_dlogsigma = (2.0 * (1.0 - p_zero)
                     * _norm.pdf(sigma_fit / math.sqrt(2.0))
                     * sigma_fit / math.sqrt(2.0))
     grad = np.array([0.0, dG_dlogsigma])
@@ -330,12 +346,181 @@ def lognormal_conditional_mean(li, ls, mu, sigma):
 def gini_lognormal_mixed(mu, sigma, p_zero):
     """Gini de distribuição mista: fração p_zero com renda zero, resto lognormal(μ,σ).
 
-    Derivação analítica pela curva de Lorenz:
-      ∫₀¹ L(q) dq = (1−p_zero)² · Φ(−σ/√2)
-      G = 1 − 2(1−p_zero)² · Φ(−σ/√2)
+    Fórmula geral para mistura com massa em zero (derivação via curva de Lorenz):
+      G = p_zero + (1−p_zero) · G_lognormal(σ)
+        = 1 − 2(1−p_zero) · Φ(−σ/√2)
     Reduz a 2Φ(σ/√2)−1 quando p_zero=0 (Gini do lognormal puro).
     """
-    return 1.0 - 2.0 * (1.0 - p_zero) ** 2 * _norm.cdf(-sigma / math.sqrt(2.0))
+    return 1.0 - 2.0 * (1.0 - p_zero) * _norm.cdf(-sigma / math.sqrt(2.0))
+
+
+def gini_mixed(G_plus, p_zero):
+    """Gini de mistura com fração p_zero de zeros e distribuição positiva com Gini G_plus.
+
+    G = p_zero + (1−p_zero) · G_plus
+    Derivado da curva de Lorenz: L_mista(p) = L_+(（p−p_zero)/(1−p_zero)) para p > p_zero.
+    """
+    return p_zero + (1.0 - p_zero) * G_plus
+
+
+# ── Distribuição Gamma ────────────────────────────────────────────────────────
+
+def gini_gamma_shape(alpha):
+    """Gini analítico da Gamma(α, β): G = Γ(α+½) / (√π · Γ(α+1)).
+
+    Invariante ao parâmetro de escala β.
+    """
+    return math.exp(_gammaln(alpha + 0.5) - 0.5 * math.log(math.pi) - _gammaln(alpha + 1))
+
+
+def _bracket_prob_gamma(li, ls, alpha, beta):
+    """P(li < X ≤ ls) para X ~ Gamma(α, scale=β)."""
+    if ls is None:
+        return 1.0 - _gamma_dist.cdf(max(li, 1e-9), a=alpha, scale=beta)
+    elif li <= 0:
+        return _gamma_dist.cdf(ls, a=alpha, scale=beta)
+    else:
+        return _gamma_dist.cdf(ls, a=alpha, scale=beta) - _gamma_dist.cdf(li, a=alpha, scale=beta)
+
+
+def fit_gamma_grouped(classes_pos):
+    """MLE de Gamma(α, β) para dados agrupados de renda positiva.
+
+    Retorna (alpha, beta, converged, neg_ll_min) ou None se ajuste falha.
+    """
+    dados = [(li, ls, pop) for li, ls, pop in classes_pos if pop > 0]
+    if len(dados) < 2:
+        return None
+    total = sum(p for _, _, p in dados)
+    if total <= 0:
+        return None
+
+    def neg_ll(params):
+        log_alpha, log_beta = params
+        alpha, beta = math.exp(log_alpha), math.exp(log_beta)
+        ll = sum(pop * math.log(max(_bracket_prob_gamma(li, ls, alpha, beta), 1e-12))
+                 for li, ls, pop in dados)
+        return -ll / total
+
+    # Inicialização via método dos momentos nos pontos médios aritméticos
+    mids, weights = [], []
+    for li, ls, pop in dados:
+        if ls is None:
+            mid = li * 1.5
+        elif li <= 0:
+            mid = max(ls / 3.0, 1e-9)
+        else:
+            mid = (li + ls) / 2.0
+        mids.append(mid); weights.append(pop)
+    w = sum(weights)
+    m1 = sum(m * ww for m, ww in zip(mids, weights)) / w
+    m2 = sum(m**2 * ww for m, ww in zip(mids, weights)) / w
+    var = max(m2 - m1**2, 1e-6)
+    alpha0 = max(0.5, m1**2 / var)
+    beta0 = max(1e-3, var / m1)
+
+    try:
+        result = minimize(
+            neg_ll,
+            [math.log(alpha0), math.log(beta0)],
+            method="Nelder-Mead",
+            options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 2000},
+        )
+        alpha_fit = math.exp(result.x[0])
+        beta_fit = math.exp(result.x[1])
+        if 0.05 < alpha_fit < 500.0 and 1e-5 < beta_fit < 1e6:
+            return alpha_fit, beta_fit, result.success, result.fun
+    except Exception:
+        pass
+    return None
+
+
+def mad_grouped(classes_pos, prob_fn):
+    """MAD entre proporções observadas e preditas pela função prob_fn(li, ls)."""
+    dados = [(li, ls, pop) for li, ls, pop in classes_pos if pop > 0]
+    if not dados:
+        return None
+    total = sum(p for _, _, p in dados)
+    if total <= 0:
+        return None
+    return sum(abs(pop / total - max(prob_fn(li, ls), 1e-12)) for li, ls, pop in dados) / len(dados)
+
+
+# ── Distribuição Singh-Maddala (Burr XII) ─────────────────────────────────────
+
+def gini_sm_numerical(a, q):
+    """Gini da Singh-Maddala F(x)=1−(1+x^a)^{−q} via G = (2/μ)·∫x·F(x)·f(x)dx − 1.
+
+    Invariante ao parâmetro de escala b: calculado com b=1.
+    Requer q > 1/a para que a média exista.
+    """
+    if q <= 1.0 / a:
+        return None
+    mean = _sm_dist.mean(c=a, d=q, scale=1.0)
+    if mean <= 0 or not math.isfinite(mean):
+        return None
+
+    def integrand(x):
+        return x * _sm_dist.cdf(x, c=a, d=q) * _sm_dist.pdf(x, c=a, d=q)
+
+    try:
+        result, _ = _integrate.quad(integrand, 0, mean * 100, limit=150)
+        G = 2.0 * result / mean - 1.0
+        if 0.0 < G < 1.0:
+            return G
+    except Exception:
+        pass
+    return None
+
+
+def _bracket_prob_sm(li, ls, a, b, q):
+    """P(li < X ≤ ls) para X ~ Singh-Maddala(a, b, q) = Burr XII(c=a, d=q, scale=b)."""
+    if ls is None:
+        return 1.0 - _sm_dist.cdf(max(li, 1e-9), c=a, d=q, scale=b)
+    elif li <= 0:
+        return _sm_dist.cdf(ls, c=a, d=q, scale=b)
+    else:
+        return _sm_dist.cdf(ls, c=a, d=q, scale=b) - _sm_dist.cdf(li, c=a, d=q, scale=b)
+
+
+def fit_sm_grouped(classes_pos):
+    """MLE de Singh-Maddala(a, b, q) para dados agrupados de renda positiva.
+
+    Retorna (a, b, q, converged, neg_ll_min) ou None se ajuste falha.
+    Exige q > 1/a para existência da média.
+    """
+    dados = [(li, ls, pop) for li, ls, pop in classes_pos if pop > 0]
+    if len(dados) < 3:
+        return None
+    total = sum(p for _, _, p in dados)
+    if total <= 0:
+        return None
+
+    def neg_ll(params):
+        log_a, log_b, log_q = params
+        a, b, q = math.exp(log_a), math.exp(log_b), math.exp(log_q)
+        if q <= 1.1 / a:
+            return 1e10
+        ll = sum(pop * math.log(max(_bracket_prob_sm(li, ls, a, b, q), 1e-12))
+                 for li, ls, pop in dados)
+        return -ll / total
+
+    try:
+        result = minimize(
+            neg_ll,
+            [math.log(2.0), math.log(1.0), math.log(2.0)],
+            method="Nelder-Mead",
+            options={"xatol": 1e-6, "fatol": 1e-8, "maxiter": 3000},
+        )
+        a_f = math.exp(result.x[0])
+        b_f = math.exp(result.x[1])
+        q_f = math.exp(result.x[2])
+        if (0.2 < a_f < 50.0 and 1e-5 < b_f < 1e6
+                and 0.1 < q_f < 100.0 and q_f > 1.1 / a_f):
+            return a_f, b_f, q_f, result.success, result.fun
+    except Exception:
+        pass
+    return None
 
 
 # ── Estrutura do Censo ─────────────────────────────────────────────────────────
@@ -886,6 +1071,7 @@ def main():
 
         gini_ic_low = gini_ic_high = gini_se = None
 
+        aic_ln = None
         if ln_params is not None:
             mu_fit, sigma_fit, converged = ln_params
             ln_sigma = sigma_fit
@@ -895,6 +1081,11 @@ def main():
             ic = ic_delta_lognormal(mu_fit, sigma_fit, p_zero, classes_pos)
             if ic is not None:
                 gini_ic_low, gini_ic_high, gini_se = ic
+            # AIC lognormal (k=2)
+            dados_ln = [(li, ls, pop) for li, ls, pop in classes_pos if pop > 0]
+            n_ln = sum(p for _, _, p in dados_ln)
+            nll_ln = _neg_ll_lognormal([mu_fit, math.log(sigma_fit)], dados_ln, n_ln)
+            aic_ln = 4.0 + 2.0 * nll_ln * n_ln
             for li, ls, _ in classes:
                 if ls is not None and not (li == 0.0 and ls == 0.0):
                     try:
@@ -903,6 +1094,38 @@ def main():
                         )
                     except Exception:
                         pass
+
+        # ── Gamma ──────────────────────────────────────────────────────────────
+        gini_gm = gm_mad = gm_converged = aic_gm = None
+        gm_params = fit_gamma_grouped(classes_pos)
+        if gm_params is not None:
+            alpha_gm, beta_gm, gm_conv, gm_nll = gm_params
+            gm_converged = gm_conv
+            G_plus_gm = gini_gamma_shape(alpha_gm)
+            gini_gm = gini_mixed(G_plus_gm, p_zero)
+            gm_mad = mad_grouped(classes_pos,
+                                  lambda li, ls: _bracket_prob_gamma(li, ls, alpha_gm, beta_gm))
+            n_gm = sum(p for _, _, p in classes_pos if p > 0)
+            aic_gm = 4.0 + 2.0 * gm_nll * n_gm  # k=2
+
+        # ── Singh-Maddala ───────────────────────────────────────────────────────
+        gini_sm_val = sm_mad = sm_converged = aic_sm = None
+        sm_params = fit_sm_grouped(classes_pos)
+        if sm_params is not None:
+            a_sm, b_sm, q_sm, sm_conv, sm_nll = sm_params
+            sm_converged = sm_conv
+            G_plus_sm = gini_sm_numerical(a_sm, q_sm)
+            if G_plus_sm is not None:
+                gini_sm_val = gini_mixed(G_plus_sm, p_zero)
+            sm_mad = mad_grouped(classes_pos,
+                                  lambda li, ls: _bracket_prob_sm(li, ls, a_sm, b_sm, q_sm))
+            n_sm = sum(p for _, _, p in classes_pos if p > 0)
+            aic_sm = 6.0 + 2.0 * sm_nll * n_sm  # k=3
+
+        # ── Melhor distribuição por AIC ─────────────────────────────────────────
+        aics = {n: v for n, v in [("lognormal", aic_ln), ("gamma", aic_gm),
+                                   ("singh_maddala", aic_sm)] if v is not None}
+        melhor_dist = min(aics, key=aics.get) if aics else None
 
         res = gini_agrupado(classes, alpha_topo=alpha_uf, medias_override=medias_override)
 
@@ -932,9 +1155,19 @@ def main():
             "gini_ic_low": round(gini_ic_low, 4) if gini_ic_low is not None else None,
             "gini_ic_high": round(gini_ic_high, 4) if gini_ic_high is not None else None,
             "gini_se": round(gini_se, 6) if gini_se is not None else None,
+            "gini_gamma": round(gini_gm, 4) if gini_gm is not None else None,
+            "gini_singh_maddala": round(gini_sm_val, 4) if gini_sm_val is not None else None,
+            "melhor_dist": melhor_dist,
+            "aic_lognormal": round(aic_ln, 2) if aic_ln is not None else None,
+            "aic_gamma": round(aic_gm, 2) if aic_gm is not None else None,
+            "aic_singh_maddala": round(aic_sm, 2) if aic_sm is not None else None,
             "ln_sigma": round(ln_sigma, 4) if ln_sigma is not None else None,
             "ln_mad": round(ln_mad, 4) if ln_mad is not None else None,
+            "gamma_mad": round(gm_mad, 4) if gm_mad is not None else None,
+            "sm_mad": round(sm_mad, 4) if sm_mad is not None else None,
             "ln_converged": ln_converged,
+            "gamma_converged": gm_converged,
+            "sm_converged": sm_converged,
             "ln_outside_bounds": ln_outside,
             "pct_sem_declaracao": round(pct_sem_dec, 4),
             "populacao_considerada": int(round(pop_classes)),
@@ -947,7 +1180,8 @@ def main():
     print(f"\n{len(res_df)} municípios → {args.saida}")
 
     # ── 6. Sumário para o paper ──────────────────────────────────────────────
-    cols_summary = [c for c in ["gini_inf", "gini_sup", "gini_lognormal"]
+    cols_summary = [c for c in ["gini_inf", "gini_sup", "gini_lognormal",
+                                "gini_gamma", "gini_singh_maddala"]
                     if c in res_df.columns]
     print("\n" + res_df[cols_summary].describe().round(4).to_string())
 
@@ -957,6 +1191,16 @@ def main():
     print(f"\nLognormal MLE : {ln_ok}/{len(res_df)} convergiram | "
           f"{n_outside} fora dos bounds ({100*n_outside/len(res_df):.1f}%) | "
           f"{n_bad} MAD > {LN_MAD_THRESHOLD} ({100*n_bad/len(res_df):.1f}%)")
+
+    if "gamma_converged" in res_df.columns:
+        gm_ok = int(res_df["gamma_converged"].sum()) if res_df["gamma_converged"].notna().any() else 0
+        print(f"Gamma MLE     : {gm_ok}/{len(res_df)} convergiram")
+    if "sm_converged" in res_df.columns:
+        sm_ok = int(res_df["sm_converged"].sum()) if res_df["sm_converged"].notna().any() else 0
+        print(f"Singh-Maddala : {sm_ok}/{len(res_df)} convergiram")
+    if "melhor_dist" in res_df.columns:
+        contagem = res_df["melhor_dist"].value_counts()
+        print(f"\nMelhor dist. (AIC): {contagem.to_dict()}")
 
     if "pct_sem_declaracao" in res_df.columns:
         n_pos = int((res_df["pct_sem_declaracao"] > 0).sum())
