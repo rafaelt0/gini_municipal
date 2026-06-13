@@ -25,6 +25,16 @@ Método: limites de Gastwirth (1972) + estimativa pontual lognormal.
     Gini = 1 − 2(1−p_zero)² Φ(−σ/√2)
     onde p_zero é a fração de domicílios sem rendimento.
 
+  Intervalos de confiança 95% (colunas gini_ic_low, gini_ic_high, gini_se):
+    Método delta aplicado ao estimador MLE lognormal.
+    A matriz de covariância assintótica é obtida invertendo a Hessiana
+    numérica da log-verossimilhança normalizada avaliada no MLE:
+      Cov(μ̂, log σ̂) ≈ (1/n) · H_code⁻¹
+    O gradiente de G em relação a (μ, log σ) é:
+      dG/d(log σ) = 2(1−p0)² φ(σ/√2) · σ/√2  (dG/dμ = 0)
+    IC 95%: Ĝ ± 1,96 · SE,  SE = √[Var(G)]
+    Nota: p_zero tratado como quantidade observada (não parâmetro).
+
   Qualidade do ajuste (coluna ln_mad):
     Desvio absoluto médio entre proporções observadas e preditas pelo
     lognormal por faixa. Valores > 0,04 indicam ajuste insatisfatório.
@@ -46,7 +56,7 @@ Método: limites de Gastwirth (1972) + estimativa pontual lognormal.
     (série ADH_GINI). Permite comparação histórica e teste de validade.
 
 Uso:
-    pip install requests pandas scipy
+    pip install requests pandas scipy numpy
     python gini_municipal_2022.py                           # todos os municípios
     python gini_municipal_2022.py --uf 35                   # só São Paulo
     python gini_municipal_2022.py --alpha 1.5               # forçar α manual
@@ -63,6 +73,7 @@ import sys
 import time
 import unicodedata
 
+import numpy as np
 import pandas as pd
 import requests
 from scipy.optimize import minimize
@@ -132,6 +143,91 @@ def parse_classe(nome: str):
     return None
 
 
+# ── Lognormal: funções auxiliares ─────────────────────────────────────────────
+
+def _bracket_prob(li, ls, mu, sigma):
+    """Probabilidade lognormal(μ,σ) de cair na faixa (li, ls)."""
+    if ls is None:
+        z_lo = (math.log(max(li, 1e-9)) - mu) / sigma
+        return 1.0 - _norm.cdf(z_lo)
+    elif li <= 0:
+        z_hi = (math.log(max(ls, 1e-9)) - mu) / sigma
+        return _norm.cdf(z_hi)
+    else:
+        z_lo = (math.log(li) - mu) / sigma
+        z_hi = (math.log(ls) - mu) / sigma
+        return _norm.cdf(z_hi) - _norm.cdf(z_lo)
+
+
+def _neg_ll_lognormal(params, dados, total):
+    """Negativa da log-verossimilhança normalizada de lognormal agrupada.
+
+    params = [mu, log_sigma]; total = soma das populações (normalização).
+    """
+    mu, log_sigma = params
+    sigma = math.exp(log_sigma)
+    ll = sum(pop * math.log(max(_bracket_prob(li, ls, mu, sigma), 1e-12))
+             for li, ls, pop in dados)
+    return -ll / total
+
+
+def ic_delta_lognormal(mu_fit, sigma_fit, p_zero, classes_pos, z=1.96):
+    """IC (z*100)% para gini_lognormal pelo método delta com Hessiana numérica.
+
+    Aplica o método delta à parametrização (μ, log σ) do MLE:
+      G = 1 − 2(1−p0)² Φ(−σ/√2)
+      dG/d(log σ) = 2(1−p0)² φ(σ/√2) · σ/√2
+      Var(G) ≈ (1/n) · ∇G^T · H_code⁻¹ · ∇G
+
+    Retorna (ic_low, ic_high, se) ou None se a Hessiana for singular.
+    """
+    dados = [(li, ls, pop) for li, ls, pop in classes_pos if pop > 0]
+    total = sum(p for _, _, p in dados)
+    if total <= 0 or len(dados) < 2:
+        return None
+
+    params_hat = [mu_fit, math.log(sigma_fit)]
+    eps = 1e-5
+
+    # Hessiana numérica 2×2 por diferenças centrais mistas
+    H = np.zeros((2, 2))
+    for i in range(2):
+        for j in range(2):
+            xpp = list(params_hat); xpp[i] += eps; xpp[j] += eps
+            xpm = list(params_hat); xpm[i] += eps; xpm[j] -= eps
+            xmp = list(params_hat); xmp[i] -= eps; xmp[j] += eps
+            xmm = list(params_hat); xmm[i] -= eps; xmm[j] -= eps
+            H[i, j] = (_neg_ll_lognormal(xpp, dados, total)
+                       - _neg_ll_lognormal(xpm, dados, total)
+                       - _neg_ll_lognormal(xmp, dados, total)
+                       + _neg_ll_lognormal(xmm, dados, total)) / (4.0 * eps * eps)
+
+    # Rejeita Hessiana não-positiva-definida (sinal de mínimo local espúrio)
+    eigvals = np.linalg.eigvalsh(H)
+    if eigvals.min() <= 0:
+        return None
+
+    try:
+        H_inv = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return None
+
+    # Gradiente de G em relação a (μ, log σ)
+    dG_dlogsigma = (2.0 * (1.0 - p_zero) ** 2
+                    * _norm.pdf(sigma_fit / math.sqrt(2.0))
+                    * sigma_fit / math.sqrt(2.0))
+    grad = np.array([0.0, dG_dlogsigma])
+
+    # Cov(θ̂) = (1/n) H_code⁻¹  →  Var(G) = (1/n) grad^T H_code⁻¹ grad
+    var_G = float(grad @ H_inv @ grad) / total
+    if var_G <= 0:
+        return None
+
+    se_G = math.sqrt(var_G)
+    gini_val = gini_lognormal_mixed(mu_fit, sigma_fit, p_zero)
+    return (max(0.0, gini_val - z * se_G), min(1.0, gini_val + z * se_G), se_G)
+
+
 # ── Lognormal MLE sobre dados agrupados ───────────────────────────────────────
 
 def fit_lognormal_grouped(classes_pos):
@@ -147,26 +243,8 @@ def fit_lognormal_grouped(classes_pos):
     if total <= 0:
         return None
 
-    def _bracket_prob(li, ls, mu, sigma):
-        if ls is None:
-            z_lo = (math.log(max(li, 1e-9)) - mu) / sigma
-            return 1.0 - _norm.cdf(z_lo)
-        elif li <= 0:
-            z_hi = (math.log(max(ls, 1e-9)) - mu) / sigma
-            return _norm.cdf(z_hi)
-        else:
-            z_lo = (math.log(li) - mu) / sigma
-            z_hi = (math.log(ls) - mu) / sigma
-            return _norm.cdf(z_hi) - _norm.cdf(z_lo)
-
     def neg_ll(params):
-        mu, log_sigma = params
-        sigma = math.exp(log_sigma)
-        ll = 0.0
-        for li, ls, pop in dados:
-            p = max(_bracket_prob(li, ls, mu, sigma), 1e-12)
-            ll += pop * math.log(p)
-        return -ll / total
+        return _neg_ll_lognormal(params, dados, total)
 
     log_mids, weights = [], []
     for li, ls, pop in dados:
@@ -215,16 +293,8 @@ def lognormal_fit_mad(classes_pos, mu, sigma):
     if total <= 0:
         return None
 
-    def _bp(li, ls):
-        if ls is None:
-            return 1.0 - _norm.cdf((math.log(max(li, 1e-9)) - mu) / sigma)
-        elif li <= 0:
-            return _norm.cdf((math.log(max(ls, 1e-9)) - mu) / sigma)
-        else:
-            return (_norm.cdf((math.log(ls) - mu) / sigma)
-                    - _norm.cdf((math.log(li) - mu) / sigma))
-
-    desvios = [abs(pop / total - max(_bp(li, ls), 1e-12)) for li, ls, pop in dados]
+    desvios = [abs(pop / total - max(_bracket_prob(li, ls, mu, sigma), 1e-12))
+               for li, ls, pop in dados]
     return sum(desvios) / len(desvios)
 
 
@@ -814,12 +884,17 @@ def main():
         ln_mad = None
         ln_outside = None
 
+        gini_ic_low = gini_ic_high = gini_se = None
+
         if ln_params is not None:
             mu_fit, sigma_fit, converged = ln_params
             ln_sigma = sigma_fit
             ln_converged = converged
             gini_ln = gini_lognormal_mixed(mu_fit, sigma_fit, p_zero)
             ln_mad = lognormal_fit_mad(classes_pos, mu_fit, sigma_fit)
+            ic = ic_delta_lognormal(mu_fit, sigma_fit, p_zero, classes_pos)
+            if ic is not None:
+                gini_ic_low, gini_ic_high, gini_se = ic
             for li, ls, _ in classes:
                 if ls is not None and not (li == 0.0 and ls == 0.0):
                     try:
@@ -854,6 +929,9 @@ def main():
             "gini_inf": round(g_inf, 4) if g_inf is not None else None,
             "gini_sup": round(g_sup, 4) if g_sup is not None else None,
             "gini_lognormal": round(gini_ln, 4) if gini_ln is not None else None,
+            "gini_ic_low": round(gini_ic_low, 4) if gini_ic_low is not None else None,
+            "gini_ic_high": round(gini_ic_high, 4) if gini_ic_high is not None else None,
+            "gini_se": round(gini_se, 6) if gini_se is not None else None,
             "ln_sigma": round(ln_sigma, 4) if ln_sigma is not None else None,
             "ln_mad": round(ln_mad, 4) if ln_mad is not None else None,
             "ln_converged": ln_converged,
